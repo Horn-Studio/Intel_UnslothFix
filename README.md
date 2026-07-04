@@ -1,6 +1,6 @@
 <div align="center">
 
-**[简体中文](#简体中文) | [繁體中文](#繁體中文) | [English](#english)**
+**[简体中文](#简体中文) | [繁體中文](#繁體中文) | [English](#english) | [日本語](#日本語) | [Русский](#русский)**
 
 </div>
 
@@ -1520,3 +1520,1013 @@ pip install transformers==5.5.0 datasets==4.3.0 trl==0.24.0 \
 ---
 
 > **Finally**: Good luck with training!
+
+---
+
+---
+
+# <a id="日本語"></a>日本語
+
+# Intel Arc A770 + Unsloth デュアルプラットフォームファインチューニングガイド
+
+> **Windows 側**: Windows 11 上で Intel Arc A770 16GB を使用し、4bit 量子化モデル（フルプレシジョンモデルもおそらく動作しますが、ここでは Qwen3-8b-bnb-4bit を例として選択）の LoRA ファインチューニングを行います。Triton の Intel XPU バックエンドは Windows 上で完全にテストされていないため、直接実行すると多数の MSVC/GCC 互換性問題が発生します。このリポジトリの一部はその解決策を提供することを目的としています。
+>
+> **WSL2/Linux 側**: 元の重みが 16GB 未満の非量子化モデル（例：Qwen3.5-4B、Qwen3-1.7B など）。このガイドでは Intel Arc A770 16GB をデバイスとして、Qwen3.5-4B をモデルとして使用します。
+
+---
+
+# Intel Arc A770 + Unsloth + Windows ファインチューニングスクリプト
+
+> **使用場面**: Windows 11 上で Intel Arc A770 16GB を使用し、4bit 量子化モデル（フルプレシジョンモデルもおそらく動作しますが、ここでは Qwen3-8b-bnb-4bit を例として選択）の LoRA ファインチューニング。
+>
+> Triton の Intel XPU バックエンドは Windows 上で完全にテストされていないため、直接実行すると多数の MSVC/GCC 互換性問題が発生します。このリポジトリの一部はその解決策を提供することを目的としています。
+
+---
+
+## 一、機能
+
+- **Windows 11** 上で **Intel Arc A770** を使用した **Qwen3-8B-BNB（あくまで例であり、他のモデルは各自でテストしてください）** モデルの Unsloth LoRA ファインチューニング
+- Intel oneAPI + MSVC コンパイル環境の自動検出と読み込み
+- Windows MSVC 下での Triton GCC パラメータ互換性問題の自動修正
+- MSVC ヘッダー/ライブラリパス欠落問題の自動修正
+- トレーニング完了後の LoRA / 16bit フルウェイト / GGUF エクスポートをサポート（完全な実行が完了していないため、最終的にフルウェイトと GGUF への変換が可能かどうかは不明です。各自で忍耐強くテストしてください）
+
+---
+
+## 二、前提インストール
+
+### ハードウェア
+- **GPU**: Intel Arc ディスクリート GPU（統合グラフィックスは理論上動作する可能性がありますが未テスト、Bシリーズも理論上動作する可能性がありますが未テスト）
+- **システム**: Windows 11
+
+### ソフトウェア
+
+| コンポーネント | バージョン/要件 | 用途 |
+|-------------|--------------|------|
+| Intel Arc グラフィックスドライバ | 最新版 (31.0.101.xxx+) | GPU 計算 |
+| Intel oneAPI Base Toolkit & DeepLearning Toolkit | 2025.2 & 最新版 | SYCL / Level Zero ランタイム |
+| Level Zero SDK | 1.28.x - 1.30.x | Triton XPU バックエンド |
+| Visual Studio 2022 | Community/Professional/Enterprise | MSVC C++ コンパイラ |
+| Python | 3.13 (Windows 版) | 実行環境 |
+| PyTorch | 2.12.1+xpu (Intel 公式 wheel) | XPU ディープラーニングフレームワーク |
+| Unsloth | 2026.6.9 | 高速ファインチューニングフレームワーク |
+
+### VS 2022 必須ワークロード
+- **"C++ によるデスクトップ開発"**
+- **MSVC v143 - VS 2022 C++ x64/x86 ビルドツール**
+- **Windows 11 SDK**
+
+---
+
+## 三、対応モデル
+
+| モデル | フォーマット | 状態 |
+|-------|------------|------|
+| Qwen3-8B-BNB | 4-bit BNB (unsloth 事前量子化) | ✅ 動作確認済みだが極めて遅い |
+
+> 他のモデルは未テストです。理論上、Unsloth がサポートし、BNB 4-bit で読み込み可能なモデルであれば動作するはずですが、追加の調整が必要になる場合があります。
+
+---
+
+## 四、Intel Arc 向けに修正したバグ
+
+### 1. Triton GCC パラメータが MSVC に透過して D8021 エラーが発生
+**現象**: `cl: コマンドライン エラー D8021 : 無効な数値引数 "/Wno-psabi"`  
+**原因**: Triton Intel XPU バックエンドが GCC スタイルでコンパイルコマンドを生成し、`cl.exe` に直接渡す  
+**修正**: `triton.runtime.build._build` をインターセプトし、`-Wno-psabi`、`-Wno-deprecated-declarations`、`-fPIC` などの GCC パラメータをフィルタリングし、`-D`/`-I`/`-L`/`-l`/`-shared` を MSVC スタイル `/D`/`-I`/`-LIBPATH:`/`lib`/`/LD` に変換
+
+### 2. MSVC が C++ 標準ライブラリヘッダー（`cstddef` など）を見つけられない
+**現象**: `fatal error C1083: インクルードファイルを開けません: "cstddef"`  
+**原因**: `vcvars64.bat` は `PATH` のみ設定し、`INCLUDE` と `LIB` 環境変数は設定しない  
+**修正**: `cl.exe` パスから MSVC ツールチェーンルートディレクトリを自動推定し、`INCLUDE`（MSVC include + Windows SDK ucrt/shared/um + ATL/MFC）と `LIB`（MSVC lib/x64 + Windows SDK lib）を補完
+
+### 3. SYCL ヘッダーが C++17 を要求
+**現象**: `error C2338: static_assert failed: 'DPCPP does not support C++ version earlier than C++17.'`  
+**原因**: MSVC はデフォルトで C++14、SYCL ヘッダーは `__cplusplus` マクロでバージョンをチェック  
+**修正**: コンパイルコマンドに `/std:c++17` と `/Zc:__cplusplus` を追加（後者は MSVC に `__cplusplus` マクロを `201703L` に正しく設定させる）
+
+### 4. リンク時に `python313.lib` が見つからない
+**現象**: `LINK : 致命的エラー LNK1104: ファイル "python313.lib" を開けません`  
+**原因**: Triton が Python 拡張（`.pyd`）をコンパイルする際、`library_dirs` は `Library/bin` と `Library/lib` のみを含み、`libs` は含まない  
+**修正**: `Python313/libs` ディレクトリを自動検出し、`/LIBPATH` に追加
+
+### 5. リンカーがエントリポイントを要求（`/LD` 欠落）
+**現象**: `LINK : 致命的エラー LNK1561: エントリポイントを定義する必要があります`  
+**原因**: `.pyd` は本質的に DLL であり、`/LD` フラグが必要だが、コンパイルコマンドにない  
+**修正**: コンパイルコマンドに `/LD`（DLL の作成）を追加
+
+### 6. Triton JIT コンパイルが極めて遅い（キャッシュが効かない）
+**現象**: トレーニングの最初のステップに 20 分以上かかり、GPU 利用率がほぼ 0%  
+**原因**: Windows 上の Triton Intel XPU バックエンドの JIT カーネルキャッシュメカニズムに問題があり、毎ステップで SPIR-V を再コンパイルする可能性がある  
+**緩和**: `TRITON_CACHE_DIR` と `TRITON_DISABLE_AUTOTUNE=1` を設定し、繰り返しコンパイルのオーバーヘッドを削減
+
+---
+
+## 五、残存問題
+
+- **トレーニング速度が極めて遅い**: コンパイル問題を修正しても、Windows 上の Triton XPU バックエンド JIT カーネル実行効率は Linux よりはるかに低い。GPU 利用率は長期間 10% を下回り、単一ステップのトレーニングにも数分から数十分かかる。
+- **Triton キャッシュが完全に信頼できない**: `TRITON_CACHE_DIR` がヒットしない場合があり、同じカーネルが複数回再コンパイルされる。
+- **Level Zero SDK バージョン不一致**: 環境変数 `ZE_PATH` は 1.30.0 を指すが、Triton コンパイルコマンドでは 1.28.2 のパスが参照されることがあり、手動での統一が必要。
+- **xformers 非対応**: Intel XPU は xformers を使用できない（CUDA のみ）、Unsloth の一部の FlashAttention 最適化が無効になる。
+- **mem_get_info クロスプラットフォーム差異**: `torch.xpu.memory.mem_get_info()` は Windows Intel Arc ドライバーでは動作するが、WSL2/Linux では使用不可（クロスプラットフォームスクリプトは注意が必要）。
+
+---
+
+## 六、バージョン説明（Release）
+
+8 番目のバージョンが初めてモデルを実際に実行できるようになったものです。最初の 7 つのバージョンは、正常なデバッグを可能にするためのバグを完全に修正していませんでした。
+
+---
+
+## 七、クイックスタート
+
+```powershell
+# 1. すべての前提ソフトウェアがインストールされていることを確認（上記参照）
+# 2. Release をダウンロードして展開
+# 3. スクリプト上部の CONFIG セクションを修正（モデルパス、データセットパスなど）
+# 4. 実行
+```
+
+---
+
+## 八、設定
+
+```python
+CONFIG = {
+    "model_path": r"H:/Qwen3-8B-unsloth-bnb-4bit",      # モデルパス
+    "dataset_path": r"D:/dataset.json",                  # データセットパス
+    "output_dir": r"H:/unsloth_train/outputs",          # 出力ディレクトリ
+    "max_seq_length": 1024,
+    "lora_r": 16,
+    "lora_alpha": 16,
+    "learning_rate": 2e-4,
+    "batch_size": 1,        # VRAM に応じて調整
+    "grad_accum": 4,        # 総 batch = batch_size * grad_accum
+    "max_steps": 3000,
+    "warmup_steps": 5,
+}
+```
+
+---
+
+## 九、トラブルシューティング
+
+| 問題 | 現象 | 解決策 |
+|------|------|--------|
+| **Triton GCC パラメータエラー** | `D8021 : 無効な数値引数 "/Wno-psabi"` | v2+ を使用；GCC パラメータはフィルタリング済み |
+| **C++ ヘッダーが見つからない** | `fatal error C1083: "cstddef"` | v4+ を使用；INCLUDE は自動修正 |
+| **SYCL が C++17 を要求** | `DPCPP does not support C++ version earlier than C++17` | v5+ を使用；`/std:c++17` を追加 |
+| **python313.lib が見つからない** | `LNK1104: ファイル "python313.lib" を開けません` | v6+ を使用；Python libs は自動追加 |
+| **エントリポイントを定義する必要がある** | `LNK1561: エントリポイントを定義する必要があります` | v7+ を使用；`/LD` を追加 |
+| **トレーニング最初のステップが極めて遅い** | 20+ 分、GPU 利用率 0% | v8 を使用；`TRITON_CACHE_DIR` を設定；それでも極めて遅い場合は WSL2/Linux へ移行 |
+| **Windows ネイティブトレーニングが許容できない** | 1523s/it、GPU 利用率 6% | **WSL2/Linux へ移行が必須**；Windows 上の Triton XPU バックエンドは最適化されていない |
+| **Level Zero バージョン不一致** | コンパイルコマンドに異なるバージョンパスが出現 | 環境変数 `ZE_PATH` を実際にインストールされた SDK バージョンと統一 |
+
+---
+
+## 十、パフォーマンス比較
+
+| 環境 | モデル | 速度 | GPU 利用率 |
+|------|--------|------|-----------|
+| Windows 11 | Qwen3-8B bnb-4bit | 1523s/it | 6% |
+| WSL2 Ubuntu 24.04 | Qwen3-8B bnb-4bit | 11-15s/it | 70-85% |
+
+> **結論**: Windows では「動作するか」という問題のみ解決でき、「速いか」という問題は解決できません。実際のトレーニングには、WSL2/Linux への移行を強く推奨します。
+
+---
+
+## 十一、ワンクリックリビルドスクリプト（Windows 環境チェック）
+
+```powershell
+# 必要な環境変数を確認
+$env:ZE_PATH
+$env:CC
+
+# VS 2022 インストールを確認
+Test-Path "C:\Program Files\Microsoft Visual Studio2\Community\VC\Auxiliary\Buildcvars64.bat"
+
+# Python バージョンを確認
+python --version  # 3.13 であるべき
+
+# PyTorch XPU を確認
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
+
+# Triton を確認
+python -c "import triton; print(triton.__version__)"
+```
+
+---
+
+## 十二、今後の予定アップデート
+
+1. **ターミナル GUI の追加**: 使いやすさの向上
+2. **最終エクスポート merged & gguf**: エクスポートはテスト待ち
+3. **Windows 速度最適化**: Intel/Triton による Windows 上の XPU バックエンドパフォーマンスの公式修正を待つ、またはパッケージの移植を試みる
+
+---
+
+> **最後に**: トレーニングが成功しますように！実際のトレーニングには WSL2/Linux をご利用ください。
+
+---
+
+---
+
+# Intel Arc A770 + Unsloth + WSL2 ファインチューニングスクリプト
+
+> **使用場面**: 元の重みが 16GB 未満の非量子化モデル（例：Qwen3.5-4B、Qwen3-1.7B など）。このガイドでは Intel Arc A770 16GB をデバイスとして、Qwen3.5-4B をモデルとして使用します。
+
+---
+
+## 一、ハードウェア / 環境要件
+
+- **GPU**: Intel Arc ディスクリート GPU（統合グラフィックスは未テスト；Bシリーズは理論上動作する可能性がありますが未テスト）
+- **OS**: Windows 11 21H2+、WSL2 有効化
+- **WSL2 ディストリビューション**: Ubuntu 24.04 (Noble)。22.04 は Intel GPU ドライバーのパッケージ名とリポジトリパスが異なる；26.04 は Python バージョンが高すぎて適さない。
+- **Python**: 3.12
+
+---
+
+## 二、WSL2 Ubuntu 24.04 インストール
+
+Windows PowerShell（管理者）で実行：
+
+```powershell
+# WSL を更新
+wsl --update
+
+# Ubuntu 24.04 をインストール
+wsl --install Ubuntu-24.04
+wsl --set-default Ubuntu-24.04
+# 見つからないと表示された場合、Microsoft サーバーが一時的にダウンしています；ストアから Ubuntu インストーラーを自分でダウンロードしてください
+
+# バージョンを確認
+wsl --list --verbose
+# Ubuntu-24.04 Running version 2 と表示されるべき
+```
+
+---
+
+## 三、Intel GPU ドライバーとランタイム設定
+
+WSL2 Ubuntu 24.04 ターミナルに入り、実行（パッケージ欠落などの問題が発生した場合は、自分で sudo apt でインストールするか AI に尋ねてください）：
+
+```bash
+# 1. システムを更新
+sudo apt update && sudo apt upgrade -y
+
+# 2. 基本ツールをインストール
+sudo apt install -y gpg-agent wget build-essential python3.12-dev
+
+# 3. Intel GPU リポジトリを追加（Noble バージョン）
+wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+  sudo gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+
+echo 'deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble unified' | \
+  sudo tee /etc/apt/sources.list.d/intel.gpu.noble.list
+
+sudo apt update
+
+# 4. Intel GPU ランタイムをインストール（重要パッケージ）
+sudo apt install -y libze-dev intel-opencl-icd intel-media-va-driver-non-free \
+  libmfx1 libvpl2 libegl-mesa0 libegl1-mesa-dev libgbm1 libgl1-mesa-dev \
+  libgl1-mesa-dri libglapi-mesa libgles2-mesa-dev libglx-mesa0 libigdgmm12 \
+  libxatracker2 mesa-va-drivers mesa-vdpau-drivers mesa-vulkan-drivers va-driver-all
+
+# 5. ユーザーを render グループに追加（GPU アクセス権限）
+sudo gpasswd -a ${USER} render
+newgrp render
+
+# 6. GPU 可視性を確認
+ls /dev/dri
+# renderD128 と card0 が見えるべき
+
+clinfo | grep "Device Name"
+# Intel(R) Arc(TM) A770 Graphics または 0x5860 などが表示されるべき
+```
+
+> **⚠️絶対注意**:
+> - フル版の oneAPI Base Toolkit はインストールしないでください（LD_LIBRARY_PATH を汚染し、PyTorch ライブラリの競合を引き起こします）
+> - 以前に oneAPI をインストールし /etc/profile.d/oneapi.sh を設定した場合、**必ず削除してください**:
+>   ```bash
+>   sudo rm /etc/profile.d/oneapi.sh
+>   ```
+> - sycl-ls が後にバージョン競合で壊れた場合、**PyTorch トレーニングには影響しません**；無視してください。
+
+---
+
+## 四、PyTorch XPU 環境インストール（仮想環境名：unsloth_env）
+
+```bash
+# 1. 仮想環境を作成
+python3 -m venv ~/unsloth_env
+source ~/unsloth_env/bin/activate
+
+# 2. pip をアップグレード
+pip install --upgrade pip setuptools wheel
+
+# 3. PyTorch XPU フルスタックをインストール（pytorch-triton-xpu 同梱；triton は個別にインストールしない）
+pip install torch==2.7.1+xpu torchvision==0.22.1+xpu torchaudio==2.7.1+xpu \
+    intel-cmplr-lib-rt intel-cmplr-lib-ur intel-cmplr-lic-rt intel-sycl-rt \
+    pytorch-triton-xpu tcmlib umf intel-pti \
+    --index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://pypi.org/simple
+
+# 4. PyTorch XPU を確認
+python -c "import torch; print('PyTorch:', torch.__version__); print('XPU:', torch.xpu.is_available())"
+
+# 5. Triton XPU を確認（正しい確認方法）
+python -c "
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def test_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+x = torch.rand(128, device='xpu')
+out = torch.empty_like(x)
+n_elements = x.numel()
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+test_kernel[grid](x, out, n_elements, BLOCK_SIZE=128)
+print('Triton XPU test passed!')
+"
+```
+
+> **⚠️注意事項**:
+> - **`pip install triton` はしないでください**（pytorch-triton-xpu を上書きし、Intel XPU バックエンドが失われ、インストールされる汎用版 triton は XPU オペレータサポートを含みません）
+> - **`pip install xformers` はしないでください**（CUDA のみ；NVIDIA ドライバーを引き込みます）
+> - **`pip install intel_extension_for_pytorch` はしないでください**（PyTorch 2.7.1+xpu は既にネイティブ XPU サポートを持ち、IPEX はバージョン競合を引き起こします）
+
+---
+
+## 五、Unsloth インストール
+
+```bash
+source ~/unsloth_env/bin/activate
+
+# 1. Unsloth をインストール（依存関係なしでインストールする必要がある）
+pip install --no-deps unsloth unsloth-zoo
+
+# 2. Unsloth のその他の依存関係を手動インストール（xformers と triton はスキップ）
+pip install transformers==5.5.0 datasets==4.3.0 trl==0.24.0 \
+    cut_cross_entropy hf_transfer msgspec torchao tyro diffusers \
+    nest-asyncio pydantic peft accelerate bitsandbytes \
+    huggingface-hub tokenizers protobuf numpy scipy tqdm regex \
+    sentencepiece safetensors psutil packaging
+```
+
+---
+
+## 六、このスクリプトが適用した修正
+
+### torch.xpu.memory.mem_get_info() 非対応
+PyTorch issue #164057、Arc A770 WSL2/Linux ドライバーはこの API を実装していません。
+**修正**: monkey-patch で固定値を返す。
+
+### torch.xpu.get_device_properties() がクラッシュする可能性
+**修正**: 例外時に FakeProps を返す。
+
+### WSL2 下での Intel XPU 顕存割り当て関数の欠落
+**修正**: 環境変数 `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` と `PYTORCH_XPU_ALLOC_CONF=expandable_segments:True` を設定。
+
+### transformers caching_allocator_warmup が OOM を引き起こす
+**修正**: `import unsloth` の前に無効化。
+
+### Triton JIT コンパイルが遅い（Intel XPU の共通問題）
+**修正**: `TRITON_CACHE_DIR` を設定してコンパイル結果をキャッシュ、`IPEX_XPU_ONEDNN_LAYOUT=1` を設定してメモリスループットを加速。
+
+### Unsloth fix_untrained_tokens と meta tensor の競合
+**修正**: この関数を無効化。
+
+---
+
+## 七、完全なトレーニングコード（v11 最適化版）
+
+リリースまたはリポジトリに提供されています。自分で探してください。最終的に動作するバージョンは v12 であり、最初の 11 バージョンは上記の問題を完全に修正していませんでした。
+
+---
+
+## 八、ワンクリックリビルドスクリプト
+
+環境を破壊した場合、このスクリプトを実行してリビルドしてください：
+
+```bash
+set -e
+
+echo ">>> 環境のリビルドを開始..."
+
+# 1. 古い環境を削除
+rm -rf ~/unsloth_env
+
+# 2. 新しい環境を作成
+python3 -m venv ~/unsloth_env
+source ~/unsloth_env/bin/activate
+
+# 3. pip をアップグレード
+pip install --upgrade pip setuptools wheel
+
+# 4. PyTorch XPU をインストール
+echo ">>> PyTorch XPU をインストール..."
+pip install torch==2.7.1+xpu torchvision==0.22.1+xpu torchaudio==2.7.1+xpu \
+    intel-cmplr-lib-rt intel-cmplr-lib-ur intel-cmplr-lic-rt intel-sycl-rt \
+    pytorch-triton-xpu tcmlib umf intel-pti \
+    --index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://pypi.org/simple
+
+# 5. PyTorch XPU を確認
+python -c "import torch; print('PyTorch:', torch.__version__); print('XPU:', torch.xpu.is_available())"
+
+# 6. Triton XPU を確認
+echo ">>> Triton XPU を確認..."
+python -c "
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def test_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+x = torch.rand(128, device='xpu')
+out = torch.empty_like(x)
+n_elements = x.numel()
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+test_kernel[grid](x, out, n_elements, BLOCK_SIZE=128)
+print('Triton XPU test passed!')
+"
+
+# 7. Unsloth をインストール（PyTorch を上書きしない）
+echo ">>> Unsloth をインストール..."
+pip install --no-deps unsloth unsloth-zoo
+
+# 8. その他の依存関係を手動インストール（xformers と triton はスキップ）
+pip install transformers==5.5.0 datasets==4.3.0 trl==0.24.0 \
+    cut_cross_entropy hf_transfer msgspec torchao tyro diffusers \
+    nest-asyncio pydantic peft accelerate bitsandbytes \
+    huggingface-hub tokenizers protobuf numpy scipy tqdm regex \
+    sentencepiece safetensors psutil packaging
+```
+
+---
+
+## 九、トレーニングの実行
+
+**期待される出力**:
+- モデルが `xpu:0` に読み込まれ、VRAM 使用量は約 8-10GB
+- 最初のステップは遅い可能性がある（Triton JIT コンパイル）、約 10-20 秒
+- 2 ステップ目からは安定して約 **11-15 秒/ステップ**
+- GPU 利用率 70-85%
+
+---
+
+## 十、トラブルシューティング
+
+| 問題 | 現象 | 解決策 |
+|------|------|--------|
+| **Ubuntu 22.04 ドライバーパッケージ名が違う** | `libze1` が見つからない、`sycl-ls` エラー | **24.04 (noble)** に変更；パッケージ名は `libze-dev` |
+| **oneAPI が LD_LIBRARY_PATH を汚染** | PyTorch が `libur_loader.so` バージョン競合を報告 | `/etc/profile.d/oneapi.sh` を削除し、oneAPI 環境変数を読み込まない |
+| **汎用 triton が xpu 版を上書き** | `0 active drivers` または `cannot import intel` | **`pip install triton` はしない**、`pytorch-triton-xpu` のみを使用 |
+| **bitsandbytes 4-bit が XPU をサポートしない** | `cdequantize_blockwise_fp32` エラー | bf16 読み込みに変更し、4-bit を使用しない |
+| **accelerate device_map トレーニング競合** | `Can't train model loaded with device_map='auto'` | モデルを GPU 全体に読み込む（`device_map="xpu"` + `low_cpu_mem_usage=True`） |
+| **meta tensor backward エラー** | `Cannot copy out of meta tensor` | モデルが GPU 上に完全にあることを確認し、CPU へのオフロードをしない |
+| **Triton JIT コンパイルが極めて遅い** | 最初のステップに 10-20 分 | 正常な動作；`TRITON_CACHE_DIR` を設定してキャッシュ；後続の再起動は速くなる |
+| **Windows ネイティブトレーニングが極めて遅い** | 1523s/it、GPU 利用率 6% | **WSL2 への移行が必須**；Windows 上の Triton XPU バックエンドは最適化されていない |
+| **HuggingFace 接続タイムアウト** | `Timed out after 120s` | `local_files_only=True` で強制オフライン読み込み |
+| **モデルメモリが二重** | CPU メモリと GPU VRAM にそれぞれコピーがある | `low_cpu_mem_usage=True` + `device_map="xpu"` |
+
+---
+
+## 十一、パフォーマンス比較
+
+| 環境 | モデル | 速度 | GPU 利用率 |
+|------|--------|------|-----------|
+| Windows 11 | Qwen3-8B bnb-4bit | 1523s/it | 6% |
+| WSL2 Ubuntu 24.04 | Qwen3.5-4B bf16 | **11-15s/it** | **70-85%** |
+
+---
+
+## 十二、今後の予定アップデート
+
+1. **ターミナル GUI の追加**: 使いやすさの向上
+2. **最終エクスポート merged と gguf**: `llama.cpp の自動ダウンロードとエクスポート
+3. **4bit モデルサポート**: Intel XPU bitsandbytes 4bit サポートはひどく壊れているので、私が修正するのを待ってください
+
+---
+
+> **最後に**: トレーニングが成功しますように！
+
+---
+
+---
+
+# <a id="русский"></a>Русский
+
+# Intel Arc A770 + Unsloth Руководство по двухплатформенной тонкой настройке
+
+> **Windows**: Использование Intel Arc A770 16GB на Windows 11 для LoRA тонкой настройки 4-битных квантованных моделей (полноточные модели, вероятно, тоже работают; здесь в качестве примера используется Qwen3-8b-bnb-4bit). Поскольку бэкенд Intel XPU для Triton не был полностью протестирован на Windows, прямой запуск вызывает множество проблем совместимости MSVC/GCC. Часть этого репозитория направлена на предоставление решения.
+>
+> **WSL2/Linux**: Неквантованные модели с исходными весами < 16GB (например, Qwen3.5-4B, Qwen3-1.7B и т.д.). В этом руководстве в качестве устройства используется Intel Arc A770 16GB, а в качестве модели — Qwen3.5-4B.
+
+---
+
+# Intel Arc A770 + Unsloth + Windows Скрипт тонкой настройки
+
+> **Сценарий использования**: LoRA тонкая настройка 4-битных квантованных моделей (полноточные модели, вероятно, тоже работают; здесь в качестве примера используется Qwen3-8b-bnb-4bit) с использованием Intel Arc A770 16GB на Windows 11.
+>
+> Поскольку бэкенд Intel XPU для Triton не был полностью протестирован на Windows, прямой запуск вызывает множество проблем совместимости MSVC/GCC. Часть этого репозитория направлена на предоставление решения.
+
+---
+
+## I. Функции
+
+- **Qwen3-8B-BNB (только пример; тестируйте другие модели самостоятельно)** модель Unsloth LoRA тонкой настройки на **Windows 11** с использованием **Intel Arc A770**
+- Автоматическое обнаружение и загрузка среды компиляции Intel oneAPI + MSVC
+- Автоматическое исправление проблем совместимости параметров GCC Triton под Windows MSVC
+- Автоматическое исправление проблем с отсутствующими путями заголовков/библиотек MSVC
+- Поддержка экспорта LoRA / 16-битных полных весов / GGUF после обучения (поскольку полный запуск не был завершен, неизвестно, работает ли окончательное преобразование в полные веса и GGUF; тестируйте терпеливо на свое усмотрение)
+
+---
+
+## II. Предварительные требования
+
+### Аппаратное обеспечение
+- **GPU**: Дискретный GPU Intel Arc (интегрированная графика теоретически работает, но не тестировалась; B-серия теоретически работает, но не тестировалась)
+- **ОС**: Windows 11
+
+### Программное обеспечение
+
+| Компонент | Версия/Требование | Назначение |
+|-----------|------------------|------------|
+| Драйвер графики Intel Arc | Последняя версия (31.0.101.xxx+) | GPU вычисления |
+| Intel oneAPI Base Toolkit & DeepLearning Toolkit | 2025.2 и последняя | SYCL / Level Zero рантайм |
+| Level Zero SDK | 1.28.x - 1.30.x | Бэкенд Triton XPU |
+| Visual Studio 2022 | Community/Professional/Enterprise | Компилятор MSVC C++ |
+| Python | 3.13 (Windows версия) | Среда выполнения |
+| PyTorch | 2.12.1+xpu (официальный wheel Intel) | Фреймворк глубокого обучения XPU |
+| Unsloth | 2026.6.9 | Фреймворк быстрой тонкой настройки |
+
+### Обязательные рабочие нагрузки VS 2022
+- **"Разработка классических приложений на C++"**
+- **MSVC v143 - VS 2022 C++ x64/x86 инструменты сборки**
+- **Windows 11 SDK**
+
+---
+
+## III. Поддерживаемые модели
+
+| Модель | Формат | Статус |
+|--------|--------|--------|
+| Qwen3-8B-BNB | 4-bit BNB (предварительная квантование unsloth) | ✅ Проверено работает, но крайне медленно |
+
+> Другие модели не тестировались. Теоретически любая модель, поддерживаемая Unsloth и загружаемая через BNB 4-bit, должна работать, но могут потребоваться дополнительные настройки.
+
+---
+
+## IV. Исправленные баги для Intel Arc
+
+### 1. Параметры GCC Triton передаются MSVC, вызывая ошибку D8021
+**Симптом**: `cl: Ошибка командной строки D8021 : недопустимый числовой аргумент "/Wno-psabi"`  
+**Причина**: Бэкенд Triton Intel XPU генерирует команды компиляции в стиле GCC и передает их напрямую `cl.exe`  
+**Исправление**: Перехват `triton.runtime.build._build`, фильтрация параметров GCC, таких как `-Wno-psabi`, `-Wno-deprecated-declarations`, `-fPIC`, и преобразование `-D`/`-I`/`-L`/`-l`/`-shared` в стиль MSVC `/D`/`-I`/`-LIBPATH:`/`lib`/`/LD`
+
+### 2. MSVC не может найти заголовки стандартной библиотеки C++ (`cstddef` и т.д.)
+**Симптом**: `fatal error C1083: Не удается открыть включаемый файл: "cstddef"`  
+**Причина**: `vcvars64.bat` устанавливает только `PATH`, а не переменные среды `INCLUDE` и `LIB`  
+**Исправление**: Автоматическое определение корневого каталога цепочки инструментов MSVC из пути `cl.exe` и дополнение `INCLUDE` (MSVC include + Windows SDK ucrt/shared/um + ATL/MFC) и `LIB` (MSVC lib/x64 + Windows SDK lib)
+
+### 3. Заголовки SYCL требуют C++17
+**Симптом**: `error C2338: static_assert failed: 'DPCPP does not support C++ version earlier than C++17.'`  
+**Причина**: MSVC по умолчанию использует C++14, а заголовки SYCL проверяют версию через макрос `__cplusplus`  
+**Исправление**: Добавление `/std:c++17` и `/Zc:__cplusplus` в команды компиляции (последнее заставляет MSVC правильно установить макрос `__cplusplus` на `201703L`)
+
+### 4. Компоновщик не может найти `python313.lib`
+**Симптом**: `LINK : Фатальная ошибка LNK1104: не удается открыть файл "python313.lib"`  
+**Причина**: При компиляции расширений Python (`.pyd`) Triton `library_dirs` содержит только `Library/bin` и `Library/lib`, но не `libs`  
+**Исправление**: Автоматическое обнаружение каталога `Python313/libs` и добавление его в `/LIBPATH`
+
+### 5. Компоновщик требует точку входа (отсутствует `/LD`)
+**Симптом**: `LINK : Фатальная ошибка LNK1561: точка входа должна быть определена`  
+**Причина**: `.pyd` по сути является DLL и требует флаг `/LD`, который отсутствует в команде компиляции  
+**Исправление**: Добавление `/LD` (создание DLL) в команду компиляции
+
+### 6. Чрезвычайно медленная JIT-компиляция Triton (кэш не работает)
+**Симптом**: Первый шаг обучения занимает 20+ минут, использование GPU близко к 0%  
+**Причина**: Механизм кэширования JIT-ядер бэкенда Triton Intel XPU на Windows имеет проблемы, потенциально перекомпилируя SPIR-V на каждом шаге  
+**Смягчение**: Установка `TRITON_CACHE_DIR` и `TRITON_DISABLE_AUTOTUNE=1` для уменьшения накладных расходов на повторную компиляцию
+
+---
+
+## V. Оставшиеся проблемы
+
+- **Чрезвычайно медленная скорость обучения**: Даже после исправления проблем компиляции, эффективность выполнения JIT-ядер бэкенда Triton XPU на Windows намного ниже, чем на Linux. Использование GPU остается ниже 10% в течение длительных периодов, и один шаг обучения по-прежнему занимает несколько минут до десятков минут.
+- **Кэш Triton не полностью надежен**: `TRITON_CACHE_DIR` иногда не срабатывает, вызывая многократную перекомпиляцию одного и того же ядра.
+- **Несоответствие версий Level Zero SDK**: Переменная среды `ZE_PATH` указывает на 1.30.0, но команды компиляции Triton могут ссылаться на пути 1.28.2; требуется ручное унифицирование.
+- **xformers не поддерживается**: Intel XPU не может использовать xformers (только CUDA), поэтому некоторые оптимизации FlashAttention от Unsloth неэффективны.
+- **Различия mem_get_info между платформами**: `torch.xpu.memory.mem_get_info()` работает на драйверах Windows Intel Arc, но недоступен на WSL2/Linux (кроссплатформенные скрипты должны учитывать это).
+
+---
+
+## VI. Примечания к версиям (Release)
+
+Восьмая версия — первая, которая может фактически начать запуск модели; первые семь версий не полностью исправили баги для нормальной отладки.
+
+---
+
+## VII. Быстрый старт
+
+```powershell
+# 1. Убедитесь, что все необходимое ПО установлено (см. выше)
+# 2. Скачайте Release и распакуйте
+# 3. Измените секцию CONFIG в верхней части скрипта (путь к модели, путь к датасету и т.д.)
+# 4. Запустите
+```
+
+---
+
+## VIII. Конфигурация
+
+```python
+CONFIG = {
+    "model_path": r"H:/Qwen3-8B-unsloth-bnb-4bit",      # Путь к модели
+    "dataset_path": r"D:/dataset.json",                  # Путь к датасету
+    "output_dir": r"H:/unsloth_train/outputs",          # Выходной каталог
+    "max_seq_length": 1024,
+    "lora_r": 16,
+    "lora_alpha": 16,
+    "learning_rate": 2e-4,
+    "batch_size": 1,        # Настроить в зависимости от VRAM
+    "grad_accum": 4,        # Общий batch = batch_size * grad_accum
+    "max_steps": 3000,
+    "warmup_steps": 5,
+}
+```
+
+---
+
+## IX. Устранение неполадок
+
+| Проблема | Симптом | Решение |
+|----------|---------|---------|
+| **Ошибка параметра Triton GCC** | `D8021 : недопустимый числовой аргумент "/Wno-psabi"` | Используйте v2+; параметры GCC отфильтрованы |
+| **Не найдены заголовки C++** | `fatal error C1083: "cstddef"` | Используйте v4+; INCLUDE исправлен автоматически |
+| **SYCL требует C++17** | `DPCPP does not support C++ version earlier than C++17` | Используйте v5+; добавлен `/std:c++17` |
+| **Не найден python313.lib** | `LNK1104: не удается открыть файл "python313.lib"` | Используйте v6+; библиотеки Python добавлены автоматически |
+| **Точка входа должна быть определена** | `LNK1561: точка входа должна быть определена` | Используйте v7+; добавлен `/LD` |
+| **Первый шаг обучения чрезвычайно медленный** | 20+ минут, использование GPU 0% | Используйте v8; установите `TRITON_CACHE_DIR`; если все еще очень медленно, перейдите на WSL2/Linux |
+| **Неприемлемая скорость нативного обучения на Windows** | 1523s/it, использование GPU 6% | **Необходим переход на WSL2/Linux**; бэкенд Triton XPU на Windows не оптимизирован |
+| **Несоответствие версий Level Zero** | В командах компиляции появляются пути разных версий | Унифицируйте переменную среды `ZE_PATH` с фактически установленной версией SDK |
+
+---
+
+## X. Сравнение производительности
+
+| Среда | Модель | Скорость | Использование GPU |
+|-------|--------|----------|-------------------|
+| Windows 11 | Qwen3-8B bnb-4bit | 1523s/it | 6% |
+| WSL2 Ubuntu 24.04 | Qwen3-8B bnb-4bit | 11-15s/it | 70-85% |
+
+> **Вывод**: На Windows мы можем решить только проблему "будет ли это работать", но не проблему "будет ли это работать быстро". Для реального обучения настоятельно рекомендуется переход на WSL2/Linux.
+
+---
+
+## XI. Скрипт восстановления в один клик (проверка среды Windows)
+
+```powershell
+# Проверьте необходимые переменные среды
+$env:ZE_PATH
+$env:CC
+
+# Проверьте установку VS 2022
+Test-Path "C:\Program Files\Microsoft Visual Studio2\Community\VC\Auxiliary\Buildcvars64.bat"
+
+# Проверьте версию Python
+python --version  # Должно быть 3.13
+
+# Проверьте PyTorch XPU
+python -c "import torch; print(torch.__version__); print(torch.xpu.is_available())"
+
+# Проверьте Triton
+python -c "import triton; print(triton.__version__)"
+```
+
+---
+
+## XII. Будущие запланированные обновления
+
+1. **Добавить терминальный GUI**: Улучшить удобство использования
+2. **Окончательный экспорт merged & gguf**: Экспорт ожидает тестирования
+3. **Оптимизация скорости Windows**: Ожидание официальных исправлений Intel/Triton для производительности бэкенда XPU на Windows или попытка портирования пакетов
+
+---
+
+> **Наконец**: Удачи в обучении! Для реального обучения, пожалуйста, перейдите на WSL2/Linux.
+
+---
+
+---
+
+# Intel Arc A770 + Unsloth + WSL2 Скрипт тонкой настройки
+
+> **Сценарий использования**: Неквантованные модели с исходными весами < 16GB (например, Qwen3.5-4B, Qwen3-1.7B и т.д.). В этом руководстве в качестве устройства используется Intel Arc A770 16GB, а в качестве модели — Qwen3.5-4B.
+
+---
+
+## I. Требования к оборудованию / среде
+
+- **GPU**: Дискретный GPU Intel Arc (интегрированная графика не тестировалась; B-серия теоретически работает, но не тестировалась)
+- **ОС**: Windows 11 21H2+, WSL2 включен
+- **Дистрибутив WSL2**: Ubuntu 24.04 (Noble). В 22.04 отличаются имена пакетов драйверов Intel GPU и пути репозиториев; в 26.04 версия Python слишком высокая и не подходит.
+- **Python**: 3.12
+
+---
+
+## II. Установка WSL2 Ubuntu 24.04
+
+Выполните в Windows PowerShell (администратор):
+
+```powershell
+# Обновите WSL
+wsl --update
+
+# Установите Ubuntu 24.04
+wsl --install Ubuntu-24.04
+wsl --set-default Ubuntu-24.04
+# Если говорит, что не найдено, серверы Microsoft временно недоступны; скачайте установщик Ubuntu из Store самостоятельно
+
+# Проверьте версию
+wsl --list --verbose
+# Должно показывать Ubuntu-24.04 Running version 2
+```
+
+---
+
+## III. Конфигурация драйвера и рантайма Intel GPU
+
+Войдите в терминал WSL2 Ubuntu 24.04 и выполните (если возникнут проблемы с отсутствующими пакетами, установите их с помощью sudo apt самостоятельно или спросите ИИ):
+
+```bash
+# 1. Обновите систему
+sudo apt update && sudo apt upgrade -y
+
+# 2. Установите базовые инструменты
+sudo apt install -y gpg-agent wget build-essential python3.12-dev
+
+# 3. Добавьте репозиторий Intel GPU (версия Noble)
+wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+  sudo gpg --dearmor --output /usr/share/keyrings/intel-graphics.gpg
+
+echo 'deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble unified' | \
+  sudo tee /etc/apt/sources.list.d/intel.gpu.noble.list
+
+sudo apt update
+
+# 4. Установите рантайм Intel GPU (ключевые пакеты)
+sudo apt install -y libze-dev intel-opencl-icd intel-media-va-driver-non-free \
+  libmfx1 libvpl2 libegl-mesa0 libegl1-mesa-dev libgbm1 libgl1-mesa-dev \
+  libgl1-mesa-dri libglapi-mesa libgles2-mesa-dev libglx-mesa0 libigdgmm12 \
+  libxatracker2 mesa-va-drivers mesa-vdpau-drivers mesa-vulkan-drivers va-driver-all
+
+# 5. Добавьте пользователя в группу render (доступ к GPU)
+sudo gpasswd -a ${USER} render
+newgrp render
+
+# 6. Проверьте видимость GPU
+ls /dev/dri
+# Должны видеть renderD128 и card0
+
+clinfo | grep "Device Name"
+# Должно показывать Intel(R) Arc(TM) A770 Graphics или что-то вроде 0x5860
+```
+
+> **⚠️ Абсолютное внимание**:
+> - НЕ устанавливайте полный oneAPI Base Toolkit (он загрязнит LD_LIBRARY_PATH и вызовет конфликты библиотек PyTorch)
+> - Если вы ранее устанавливали oneAPI и настроили /etc/profile.d/oneapi.sh, **вы ДОЛЖНЫ удалить его**:
+>   ```bash
+>   sudo rm /etc/profile.d/oneapi.sh
+>   ```
+> - Если sycl-ls позже сломается из-за конфликтов версий, **это не влияет на обучение PyTorch**; игнорируйте.
+
+---
+
+## IV. Установка среды PyTorch XPU (имя виртуальной среды: unsloth_env)
+
+```bash
+# 1. Создайте виртуальную среду
+python3 -m venv ~/unsloth_env
+source ~/unsloth_env/bin/activate
+
+# 2. Обновите pip
+pip install --upgrade pip setuptools wheel
+
+# 3. Установите полный стек PyTorch XPU (включает pytorch-triton-xpu; НЕ устанавливайте triton отдельно)
+pip install torch==2.7.1+xpu torchvision==0.22.1+xpu torchaudio==2.7.1+xpu \
+    intel-cmplr-lib-rt intel-cmplr-lib-ur intel-cmplr-lic-rt intel-sycl-rt \
+    pytorch-triton-xpu tcmlib umf intel-pti \
+    --index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://pypi.org/simple
+
+# 4. Проверьте PyTorch XPU
+python -c "import torch; print('PyTorch:', torch.__version__); print('XPU:', torch.xpu.is_available())"
+
+# 5. Проверьте Triton XPU (правильный метод проверки)
+python -c "
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def test_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+x = torch.rand(128, device='xpu')
+out = torch.empty_like(x)
+n_elements = x.numel()
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+test_kernel[grid](x, out, n_elements, BLOCK_SIZE=128)
+print('Triton XPU test passed!')
+"
+```
+
+> **⚠️ Примечания**:
+> - **НЕ делайте** `pip install triton` (это перезапишет pytorch-triton-xpu, вызвав потерю бэкенда Intel XPU, а установленный общий triton не включает поддержку XPU операторов)
+> - **НЕ делайте** `pip install xformers` (только CUDA; потянет драйверы NVIDIA)
+> - **НЕ делайте** `pip install intel_extension_for_pytorch` (PyTorch 2.7.1+xpu уже имеет нативную поддержку XPU; IPEX вызовет конфликты версий)
+
+---
+
+## V. Установка Unsloth
+
+```bash
+source ~/unsloth_env/bin/activate
+
+# 1. Установите Unsloth (должно быть без зависимостей)
+pip install --no-deps unsloth unsloth-zoo
+
+# 2. Вручную установите другие зависимости Unsloth (пропустите xformers и triton)
+pip install transformers==5.5.0 datasets==4.3.0 trl==0.24.0 \
+    cut_cross_entropy hf_transfer msgspec torchao tyro diffusers \
+    nest-asyncio pydantic peft accelerate bitsandbytes \
+    huggingface-hub tokenizers protobuf numpy scipy tqdm regex \
+    sentencepiece safetensors psutil packaging
+```
+
+---
+
+## VI. Исправления, примененные этим скриптом
+
+### torch.xpu.memory.mem_get_info() не поддерживается
+PyTorch issue #164057, драйвер Arc A770 WSL2/Linux не реализовал этот API.
+**Исправление**: Monkey-patch для возврата фиксированных значений.
+
+### torch.xpu.get_device_properties() может аварийно завершиться
+**Исправление**: Возврат FakeProps при исключении.
+
+### Intel XPU отсутствуют функции выделения VRAM под WSL2
+**Исправление**: Установка переменных среды `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` и `PYTORCH_XPU_ALLOC_CONF=expandable_segments:True`.
+
+### transformers caching_allocator_warmup вызывает OOM
+**Исправление**: Отключить перед `import unsloth`.
+
+### Медленная JIT-компиляция Triton (общая проблема Intel XPU)
+**Исправление**: Установка `TRITON_CACHE_DIR` для кэширования результатов компиляции; установка `IPEX_XPU_ONEDNN_LAYOUT=1` для ускорения пропускной способности памяти.
+
+### Конфликт Unsloth fix_untrained_tokens с meta tensor
+**Исправление**: Отключить эту функцию.
+
+---
+
+## VII. Полный код обучения (оптимизированная версия v11)
+
+Предоставлено в релизах или репозитории; найдите его самостоятельно. Окончательная рабочая версия — v12; первые 11 версий не полностью исправили вышеуказанные проблемы.
+
+---
+
+## VIII. Скрипт восстановления в один клик
+
+Если вы сломали свою среду, запустите этот скрипт для восстановления:
+
+```bash
+set -e
+
+echo ">>> Начинается восстановление среды..."
+
+# 1. Удалите старую среду
+rm -rf ~/unsloth_env
+
+# 2. Создайте новую среду
+python3 -m venv ~/unsloth_env
+source ~/unsloth_env/bin/activate
+
+# 3. Обновите pip
+pip install --upgrade pip setuptools wheel
+
+# 4. Установите PyTorch XPU
+echo ">>> Установка PyTorch XPU..."
+pip install torch==2.7.1+xpu torchvision==0.22.1+xpu torchaudio==2.7.1+xpu \
+    intel-cmplr-lib-rt intel-cmplr-lib-ur intel-cmplr-lic-rt intel-sycl-rt \
+    pytorch-triton-xpu tcmlib umf intel-pti \
+    --index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://pypi.org/simple
+
+# 5. Проверьте PyTorch XPU
+python -c "import torch; print('PyTorch:', torch.__version__); print('XPU:', torch.xpu.is_available())"
+
+# 6. Проверьте Triton XPU
+echo ">>> Проверка Triton XPU..."
+python -c "
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def test_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x, mask=mask)
+
+x = torch.rand(128, device='xpu')
+out = torch.empty_like(x)
+n_elements = x.numel()
+grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+test_kernel[grid](x, out, n_elements, BLOCK_SIZE=128)
+print('Triton XPU test passed!')
+"
+
+# 7. Установите Unsloth (не перезаписывайте PyTorch)
+echo ">>> Установка Unsloth..."
+pip install --no-deps unsloth unsloth-zoo
+
+# 8. Вручную установите другие зависимости (пропустите xformers и triton)
+pip install transformers==5.5.0 datasets==4.3.0 trl==0.24.0 \
+    cut_cross_entropy hf_transfer msgspec torchao tyro diffusers \
+    nest-asyncio pydantic peft accelerate bitsandbytes \
+    huggingface-hub tokenizers protobuf numpy scipy tqdm regex \
+    sentencepiece safetensors psutil packaging
+```
+
+---
+
+## IX. Запуск обучения
+
+**Ожидаемый вывод**:
+- Модель загружена в `xpu:0`, использование VRAM примерно 8-10GB
+- Первый шаг может быть медленным (JIT-компиляция Triton), примерно 10-20 секунд
+- Со второго шага стабильно примерно **11-15 секунд/шаг**
+- Использование GPU 70-85%
+
+---
+
+## X. Устранение неполадок
+
+| Проблема | Симптом | Решение |
+|----------|---------|---------|
+| **Неверное имя пакета драйвера Ubuntu 22.04** | `libze1` не найден, ошибки `sycl-ls` | Перейдите на **24.04 (noble)**; имя пакета — `libze-dev` |
+| **oneAPI загрязняет LD_LIBRARY_PATH** | PyTorch сообщает о конфликте версий `libur_loader.so` | Удалите `/etc/profile.d/oneapi.sh`, не загружайте переменные среды oneAPI |
+| **Общий triton перезаписывает версию xpu** | `0 active drivers` или `cannot import intel` | **НЕ делайте** `pip install triton`; используйте только `pytorch-triton-xpu` |
+| **bitsandbytes 4-bit не поддерживается на XPU** | Ошибка `cdequantize_blockwise_fp32` | Используйте загрузку bf16 вместо 4-bit |
+| **Конфликт обучения accelerate device_map** | `Can't train model loaded with device_map='auto'` | Загрузите всю модель в GPU (`device_map="xpu"` + `low_cpu_mem_usage=True`) |
+| **Ошибка meta tensor backward** | `Cannot copy out of meta tensor` | Убедитесь, что модель полностью на GPU, без оффлоада на CPU |
+| **Чрезвычайно медленная JIT-компиляция Triton** | Первый шаг 10-20 минут | Нормальное поведение; установите `TRITON_CACHE_DIR` для кэширования; последующие перезапуски будут быстрее |
+| **Чрезвычайно медленное нативное обучение на Windows** | 1523s/it, использование GPU 6% | **Необходим переход на WSL2**; бэкенд Triton XPU на Windows не оптимизирован |
+| **Таймаут сети HuggingFace** | `Timed out after 120s` | `local_files_only=True` для принудительной автономной загрузки |
+| **Дублирование памяти модели** | Копия в CPU RAM и GPU VRAM | `low_cpu_mem_usage=True` + `device_map="xpu"` |
+
+---
+
+## XI. Сравнение производительности
+
+| Среда | Модель | Скорость | Использование GPU |
+|-------|--------|----------|-------------------|
+| Windows 11 | Qwen3-8B bnb-4bit | 1523s/it | 6% |
+| WSL2 Ubuntu 24.04 | Qwen3.5-4B bf16 | **11-15s/it** | **70-85%** |
+
+---
+
+## XII. Будущие запланированные обновления
+
+1. **Добавить терминальный GUI**: Улучшить удобство использования
+2. **Окончательный экспорт merged и gguf**: `Автоматическая загрузка llama.cpp для экспорта
+3. **Поддержка 4-битных моделей**: Поддержка bitsandbytes 4-bit для Intel XPU ужасно сломана; я исправлю это, когда доберусь
+
+---
+
+> **Наконец**: Удачи в обучении!
